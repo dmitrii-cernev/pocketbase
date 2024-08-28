@@ -12,6 +12,8 @@ ADD https://github.com/pocketbase/pocketbase/releases/download/v${PB_VERSION}/po
 RUN unzip /tmp/pb.zip -d /app/
 RUN rm /tmp/pb.zip
 
-EXPOSE 8080
+# Expose the updated port 8191 for both IPv4 and IPv6
+EXPOSE 8191
 
-ENTRYPOINT ["/app/pocketbase", "serve", "--http=0.0.0.0:8080"]
+# Use "::" to bind to all available IPv4 and IPv6 addresses
+ENTRYPOINT ["/app/pocketbase", "serve", "--http=[::]:8191"]
