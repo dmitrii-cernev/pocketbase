@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8191:8191"
+    volumes:
+      - app-data:/app/data
+    restart: always
+
+volumes:
+  app-data:
+    driver: local
