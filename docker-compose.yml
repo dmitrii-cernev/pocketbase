@@ -4,9 +4,9 @@ services:
     ports:
       - "8191:8191"
     volumes:
-      - app-data:/app/data
+      - pocketbase-data:/app/data
     restart: always
 
 volumes:
-  app-data:
+  pocketbase-data:
     driver: local
