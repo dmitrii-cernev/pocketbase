@@ -280,6 +280,14 @@ func (form *RecordOAuth2Login) submit(data *RecordOAuth2LoginData) error {
 			}
 		}
 
+		// update the existing auth record name if the data.OAuth2User has one
+		if data.OAuth2User.Name != "" {
+			data.Record.Set("name", data.OAuth2User.Name)
+			if err := txDao.SaveRecord(data.Record); err != nil {
+				return err
+			}
+		}
+
 		// create ExternalAuth relation if missing
 		if data.ExternalAuth == nil {
 			data.ExternalAuth = &models.ExternalAuth{
