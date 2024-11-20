@@ -1,5 +1,5 @@
 services:
-  app:
+  pb:
     build: .
     ports:
       - "8191:8191"

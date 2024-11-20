@@ -23,6 +23,9 @@ WORKDIR /app
 # Copy the built application from the builder stage
 COPY --from=builder /app/base .
 
+# Copy the pb_migrations folder
+COPY --from=builder /app/examples/base/pb_migrations /app/pb_migrations
+
 # Expose the application port
 EXPOSE 8191
 
