@@ -29,6 +29,9 @@ COPY --from=builder /app/examples/base/pb_migrations /app/pb_migrations
 # Expose the application port
 EXPOSE 8191
 
+# Run the migration commands during the build process
+RUN ./base migrate up
+RUN ./base migrate history-sync
+
 # Run the application
 CMD ["./base", "serve", "--http=[::]:8191"]
-CMD ["./base", "migrate", "history-sync"]
