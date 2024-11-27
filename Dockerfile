@@ -31,3 +31,4 @@ EXPOSE 8191
 
 # Run the application
 CMD ["./base", "serve", "--http=[::]:8191"]
+CMD ["./base", "migrate", "history-sync"]
