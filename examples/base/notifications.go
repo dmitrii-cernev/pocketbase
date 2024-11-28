@@ -8,61 +8,89 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 )
 
-func createNotification(app *pocketbase.PocketBase, userId string, message string, ticketId string) error {
-	collection, err := app.FindCollectionByNameOrId("notifications")
-	if err != nil {
-		return err
-	}
-	record := core.NewRecord(collection)
+// Constants for collection names and roles
+const (
+	CollectionNotifications = "notifications"
+	CollectionUsers         = "users"
+	CollectionTickets       = "tickets"
+	CollectionComments      = "commentaries"
 
-	record.Set("user", userId)
-	record.Set("message", message)
-	record.Set("ticket", ticketId)
-	record.Set("viewed", false)
+	RoleAdmin = "admin"
+)
 
-	return app.Save(record)
+// Field names
+const (
+	FieldReporter  = "reporter"
+	FieldAssignee  = "assignee"
+	FieldTitle     = "title"
+	FieldUser      = "user"
+	FieldTicket    = "ticket"
+	FieldWatchers  = "watchers"
+	FieldUpdatedBy = "updated_by"
+	FieldMessage   = "message"
+	FieldViewed    = "viewed"
+)
+
+// NotificationService handles notification creation and delivery
+type NotificationService struct {
+	app *pocketbase.PocketBase
 }
 
-func getAdmins(app *pocketbase.PocketBase, excludeUserIds []string) ([]*core.Record, error) {
-	admins, err := app.FindRecordsByFilter(
-		"users",
-		"role = 'admin'",
+func NewNotificationService(app *pocketbase.PocketBase) *NotificationService {
+	return &NotificationService{app: app}
+}
+
+func (s *NotificationService) Create(userId, message, ticketId string) error {
+	collection, err := s.app.FindCollectionByNameOrId(CollectionNotifications)
+	if err != nil {
+		return fmt.Errorf("failed to find notifications collection: %w", err)
+	}
+
+	record := core.NewRecord(collection)
+	record.Set(FieldUser, userId)
+	record.Set(FieldMessage, message)
+	record.Set(FieldTicket, ticketId)
+	record.Set(FieldViewed, false)
+
+	if err := s.app.Save(record); err != nil {
+		return fmt.Errorf("failed to save notification: %w", err)
+	}
+
+	return nil
+}
+
+// AdminService handles admin-related operations
+type AdminService struct {
+	app *pocketbase.PocketBase
+}
+
+func NewAdminService(app *pocketbase.PocketBase) *AdminService {
+	return &AdminService{app: app}
+}
+
+func (s *AdminService) GetAdmins(excludeUserIds []string) ([]*core.Record, error) {
+	admins, err := s.app.FindRecordsByFilter(
+		CollectionUsers,
+		fmt.Sprintf("role = '%s'", RoleAdmin),
 		"-created",
 		100,
 		0,
 	)
-
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch admins: %w", err)
 	}
 
-	// Filter out excluded users
-	filteredAdmins := make([]*core.Record, 0)
-	for _, admin := range admins {
-		excluded := false
-		for _, excludeId := range excludeUserIds {
-			if admin.Id == excludeId {
-				excluded = true
-				break
-			}
-		}
-		if !excluded {
-			filteredAdmins = append(filteredAdmins, admin)
-		}
-	}
-
-	return filteredAdmins, nil
+	return filterExcludedUsers(admins, excludeUserIds), nil
 }
 
-func notifyAdmins(app *pocketbase.PocketBase, message string, ticketId string, excludeUserIds []string) error {
-	admins, err := getAdmins(app, excludeUserIds)
+func (s *AdminService) NotifyAll(notifService *NotificationService, message, ticketId string, excludeUserIds []string) error {
+	admins, err := s.GetAdmins(excludeUserIds)
 	if err != nil {
 		return err
 	}
 
 	for _, admin := range admins {
-		err := createNotification(app, admin.Id, message, ticketId)
-		if err != nil {
+		if err := notifService.Create(admin.Id, message, ticketId); err != nil {
 			log.Printf("Failed to notify admin %s: %v", admin.Id, err)
 		}
 	}
@@ -70,207 +98,171 @@ func notifyAdmins(app *pocketbase.PocketBase, message string, ticketId string, e
 	return nil
 }
 
-func triggerNotifications(app *pocketbase.PocketBase) {
-	// Handle ticket creation
-	app.OnRecordAfterCreateSuccess("tickets").BindFunc(func(e *core.RecordEvent) error {
-		ticket := e.Record
-		reporter := ticket.Get("reporter").(string)
-		assignee, _ := ticket.Get("assignee").(string)
-		title := ticket.Get("title").(string)
+// Utility functions
+func filterExcludedUsers(users []*core.Record, excludeUserIds []string) []*core.Record {
+	if len(excludeUserIds) == 0 {
+		return users
+	}
 
-		excludeUserIds := []string{reporter}
-		if assignee != "" {
-			excludeUserIds = append(excludeUserIds, assignee)
+	filtered := make([]*core.Record, 0, len(users))
+	for _, user := range users {
+		if !contains(excludeUserIds, user.Id) {
+			filtered = append(filtered, user)
 		}
+	}
+	return filtered
+}
 
-		// Notify the creator
-		err := createNotification(
-			app,
-			reporter,
-			fmt.Sprintf("You have created a new ticket: %s", title),
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func safeGetString(record *core.Record, field string) string {
+	if val, ok := record.Get(field).(string); ok {
+		return val
+	}
+	return ""
+}
+
+func safeGetStringSlice(record *core.Record, field string) []string {
+	if val, ok := record.Get(field).([]string); ok {
+		return val
+	}
+	return []string{}
+}
+
+// TicketNotifier handles ticket-related notifications
+type TicketNotifier struct {
+	notifService *NotificationService
+	adminService *AdminService
+}
+
+func NewTicketNotifier(app *pocketbase.PocketBase) *TicketNotifier {
+	return &TicketNotifier{
+		notifService: NewNotificationService(app),
+		adminService: NewAdminService(app),
+	}
+}
+
+func (tn *TicketNotifier) NotifyTicketCreation(ticket *core.Record) error {
+	reporter := safeGetString(ticket, FieldReporter)
+	assignee := safeGetString(ticket, FieldAssignee)
+	title := safeGetString(ticket, FieldTitle)
+
+	excludeUserIds := []string{reporter}
+	if assignee != "" {
+		excludeUserIds = append(excludeUserIds, assignee)
+	}
+
+	// Notify creator
+	if err := tn.notifService.Create(
+		reporter,
+		fmt.Sprintf("You have created a new ticket: %s", title),
+		ticket.Id,
+	); err != nil {
+		log.Printf("Failed to notify reporter: %v", err)
+	}
+
+	// Notify assignee if different from creator
+	if assignee != "" && assignee != reporter {
+		if err := tn.notifService.Create(
+			assignee,
+			fmt.Sprintf("You have been assigned to a new ticket: %s", title),
 			ticket.Id,
-		)
-		if err != nil {
+		); err != nil {
+			log.Printf("Failed to notify assignee: %v", err)
+		}
+	}
+
+	// Notify admins
+	return tn.adminService.NotifyAll(
+		tn.notifService,
+		fmt.Sprintf("A new ticket has been created: %s", title),
+		ticket.Id,
+		excludeUserIds,
+	)
+}
+
+func (tn *TicketNotifier) NotifyTicketUpdate(ticket *core.Record) error {
+	currentUserId := safeGetString(ticket, FieldUpdatedBy)
+	reporter := safeGetString(ticket, FieldReporter)
+	assignee := safeGetString(ticket, FieldAssignee)
+	title := safeGetString(ticket, FieldTitle)
+	watchers := safeGetStringSlice(ticket, FieldWatchers)
+
+	excludeUserIds := []string{currentUserId, reporter, assignee}
+
+	// Notify relevant parties
+	if reporter != currentUserId {
+		if err := tn.notifService.Create(
+			reporter,
+			fmt.Sprintf("A ticket you reported has been updated: %s", title),
+			ticket.Id,
+		); err != nil {
 			log.Printf("Failed to notify reporter: %v", err)
 		}
+	}
 
-		// Notify the assignee if different from the creator
-		if assignee != "" && assignee != reporter {
-			err := createNotification(
-				app,
-				assignee,
-				fmt.Sprintf("You have been assigned to a new ticket: %s", title),
+	if assignee != "" && assignee != currentUserId && assignee != reporter {
+		if err := tn.notifService.Create(
+			assignee,
+			fmt.Sprintf("A ticket assigned to you has been updated: %s", title),
+			ticket.Id,
+		); err != nil {
+			log.Printf("Failed to notify assignee: %v", err)
+		}
+	}
+
+	// Notify watchers
+	for _, watcherId := range watchers {
+		if !contains(excludeUserIds, watcherId) {
+			if err := tn.notifService.Create(
+				watcherId,
+				fmt.Sprintf("A ticket you're watching has been updated: %s", title),
 				ticket.Id,
-			)
-			if err != nil {
-				log.Printf("Failed to notify assignee: %v", err)
+			); err != nil {
+				log.Printf("Failed to notify watcher %s: %v", watcherId, err)
 			}
 		}
+	}
 
-		// Notify all admins
-		return notifyAdmins(
-			app,
-			fmt.Sprintf("A new ticket has been created: %s", title),
-			ticket.Id,
-			excludeUserIds,
-		)
+	return tn.adminService.NotifyAll(
+		tn.notifService,
+		fmt.Sprintf("A ticket has been updated: %s", title),
+		ticket.Id,
+		excludeUserIds,
+	)
+}
+
+// SetupNotifications Setup notification handlers
+func SetupNotifications(app *pocketbase.PocketBase) {
+	ticketNotifier := NewTicketNotifier(app)
+
+	// Handle ticket creation
+	app.OnRecordAfterCreateSuccess(CollectionTickets).BindFunc(func(e *core.RecordEvent) error {
+		return ticketNotifier.NotifyTicketCreation(e.Record)
 	})
 
 	// Handle ticket updates
-	app.OnRecordAfterUpdateSuccess("tickets").BindFunc(func(e *core.RecordEvent) error {
-		ticket := e.Record
-		currentUserId := ticket.Get("updated_by").(string)
-		reporter := ticket.Get("reporter").(string)
-		assignee, _ := ticket.Get("assignee").(string)
-		title := ticket.Get("title").(string)
-
-		excludeUserIds := []string{currentUserId}
-		if reporter != "" {
-			excludeUserIds = append(excludeUserIds, reporter)
-		}
-		if assignee != "" {
-			excludeUserIds = append(excludeUserIds, assignee)
-		}
-
-		// Notify the reporter if they're not the one updating
-		if reporter != currentUserId {
-			err := createNotification(
-				app,
-				reporter,
-				fmt.Sprintf("A ticket you reported has been updated: %s", title),
-				ticket.Id,
-			)
-			if err != nil {
-				log.Printf("Failed to notify reporter: %v", err)
-			}
-		}
-
-		// Notify the assignee if they're not the one updating and different from the reporter
-		if assignee != "" && assignee != currentUserId && assignee != reporter {
-			err := createNotification(
-				app,
-				assignee,
-				fmt.Sprintf("A ticket assigned to you has been updated: %s", title),
-				ticket.Id,
-			)
-			if err != nil {
-				log.Printf("Failed to notify assignee: %v", err)
-			}
-		}
-
-		// Notify watchers
-		if watchers, ok := ticket.Get("watchers").([]string); ok {
-			for _, watcherId := range watchers {
-				isExcluded := false
-				for _, excludeId := range excludeUserIds {
-					if watcherId == excludeId {
-						isExcluded = true
-						break
-					}
-				}
-				if !isExcluded {
-					err := createNotification(
-						app,
-						watcherId,
-						fmt.Sprintf("A ticket you're watching has been updated: %s", title),
-						ticket.Id,
-					)
-					if err != nil {
-						log.Printf("Failed to notify watcher %s: %v", watcherId, err)
-					}
-				}
-			}
-		}
-
-		// Notify all admins
-		return notifyAdmins(
-			app,
-			fmt.Sprintf("A ticket has been updated: %s", title),
-			ticket.Id,
-			excludeUserIds,
-		)
+	app.OnRecordAfterUpdateSuccess(CollectionTickets).BindFunc(func(e *core.RecordEvent) error {
+		return ticketNotifier.NotifyTicketUpdate(e.Record)
 	})
 
 	// Handle comment creation
-	app.OnRecordAfterCreateSuccess("commentaries").BindFunc(func(e *core.RecordEvent) error {
+	app.OnRecordAfterCreateSuccess(CollectionComments).BindFunc(func(e *core.RecordEvent) error {
 		comment := e.Record
-		currentUserId := comment.Get("user").(string)
-		ticketId := comment.Get("ticket").(string)
+		ticketId := safeGetString(comment, FieldTicket)
 
-		// Get the related ticket
-		ticket, err := app.FindRecordById("tickets", ticketId)
+		ticket, err := app.FindRecordById(CollectionTickets, ticketId)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to find ticket: %w", err)
 		}
 
-		reporter := ticket.Get("reporter").(string)
-		assignee, _ := ticket.Get("assignee").(string)
-		title := ticket.Get("title").(string)
-
-		excludeUserIds := []string{currentUserId}
-		if reporter != "" {
-			excludeUserIds = append(excludeUserIds, reporter)
-		}
-		if assignee != "" {
-			excludeUserIds = append(excludeUserIds, assignee)
-		}
-
-		// Notify the ticket reporter if they're not the one commenting
-		if reporter != currentUserId {
-			err := createNotification(
-				app,
-				reporter,
-				fmt.Sprintf("A new comment has been added to your ticket: %s", title),
-				ticketId,
-			)
-			if err != nil {
-				log.Printf("Failed to notify reporter: %v", err)
-			}
-		}
-
-		// Notify the ticket assignee if they're not the one commenting and different from the reporter
-		if assignee != "" && assignee != currentUserId && assignee != reporter {
-			err := createNotification(
-				app,
-				assignee,
-				fmt.Sprintf("A new comment has been added to a ticket assigned to you: %s", title),
-				ticketId,
-			)
-			if err != nil {
-				log.Printf("Failed to notify assignee: %v", err)
-			}
-		}
-
-		// Notify watchers
-		if watchers, ok := ticket.Get("watchers").([]string); ok {
-			for _, watcherId := range watchers {
-				isExcluded := false
-				for _, excludeId := range excludeUserIds {
-					if watcherId == excludeId {
-						isExcluded = true
-						break
-					}
-				}
-				if !isExcluded {
-					err := createNotification(
-						app,
-						watcherId,
-						fmt.Sprintf("A new comment has been added to a ticket you're watching: %s", title),
-						ticketId,
-					)
-					if err != nil {
-						log.Printf("Failed to notify watcher %s: %v", watcherId, err)
-					}
-				}
-			}
-		}
-
-		// Notify all admins
-		return notifyAdmins(
-			app,
-			fmt.Sprintf("A new comment has been added to ticket: %s", title),
-			ticketId,
-			excludeUserIds,
-		)
+		return ticketNotifier.NotifyTicketUpdate(ticket)
 	})
 }
