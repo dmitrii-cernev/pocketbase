@@ -116,6 +116,8 @@ func main() {
 		Priority: 999, // execute as latest as possible to allow users to provide their own route
 	})
 
+	triggerNotifications(app)
+
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
