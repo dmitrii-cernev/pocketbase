@@ -12,29 +12,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/dop251/goja"
 	validation "github.com/go-ozzo/ozzo-validation/v4"
-	"github.com/labstack/echo/v5"
-	"github.com/labstack/echo/v5/middleware"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/daos"
 	"github.com/pocketbase/pocketbase/forms"
 	"github.com/pocketbase/pocketbase/mails"
-	"github.com/pocketbase/pocketbase/models"
-	"github.com/pocketbase/pocketbase/models/schema"
-	"github.com/pocketbase/pocketbase/tokens"
-	"github.com/pocketbase/pocketbase/tools/cron"
 	"github.com/pocketbase/pocketbase/tools/filesystem"
 	"github.com/pocketbase/pocketbase/tools/hook"
 	"github.com/pocketbase/pocketbase/tools/inflector"
-	"github.com/pocketbase/pocketbase/tools/list"
 	"github.com/pocketbase/pocketbase/tools/mailer"
-	"github.com/pocketbase/pocketbase/tools/rest"
+	"github.com/pocketbase/pocketbase/tools/router"
 	"github.com/pocketbase/pocketbase/tools/security"
 	"github.com/pocketbase/pocketbase/tools/subscriptions"
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -49,11 +43,11 @@ func hooksBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 	appType := reflect.TypeOf(app)
 	appValue := reflect.ValueOf(app)
 	totalMethods := appType.NumMethod()
-	excludeHooks := []string{"OnBeforeServe"}
+	excludeHooks := []string{"OnServe"}
 
 	for i := 0; i < totalMethods; i++ {
 		method := appType.Method(i)
-		if !strings.HasPrefix(method.Name, "On") || list.ExistInSlice(method.Name, excludeHooks) {
+		if !strings.HasPrefix(method.Name, "On") || slices.Contains(excludeHooks, method.Name) {
 			continue // not a hook or excluded
 		}
 
@@ -61,6 +55,8 @@ func hooksBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 
 		// register the hook to the loader
 		loader.Set(jsName, func(callback string, tags ...string) {
+			// overwrite the global $app with the hook scoped instance
+			callback = `function(e) { $app = e.app; return (` + callback + `).call(undefined, e) }`
 			pr := goja.MustCompile("", "{("+callback+").apply(undefined, __args)}", true)
 
 			tagsAsValues := make([]reflect.Value, len(tags))
@@ -69,9 +65,9 @@ func hooksBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 			}
 
 			hookInstance := appValue.MethodByName(method.Name).Call(tagsAsValues)[0]
-			addFunc := hookInstance.MethodByName("Add")
+			hookBindFunc := hookInstance.MethodByName("BindFunc")
 
-			handlerType := addFunc.Type().In(0)
+			handlerType := hookBindFunc.Type().In(0)
 
 			handler := reflect.MakeFunc(handlerType, func(args []reflect.Value) (results []reflect.Value) {
 				handlerArgs := make([]any, len(args))
@@ -80,19 +76,15 @@ func hooksBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 				}
 
 				err := executors.run(func(executor *goja.Runtime) error {
+					executor.Set("$app", goja.Undefined())
 					executor.Set("__args", handlerArgs)
 					res, err := executor.RunProgram(pr)
 					executor.Set("__args", goja.Undefined())
 
-					// check for returned error or false
+					// check for returned error value
 					if res != nil {
-						switch v := res.Export().(type) {
-						case error:
-							return v
-						case bool:
-							if !v {
-								return hook.StopPropagation
-							}
+						if resErr, ok := res.Export().(error); ok {
+							return resErr
 						}
 					}
 
@@ -103,20 +95,16 @@ func hooksBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 			})
 
 			// register the wrapped hook handler
-			addFunc.Call([]reflect.Value{handler})
+			hookBindFunc.Call([]reflect.Value{handler})
 		})
 	}
 }
 
 func cronBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
-	scheduler := cron.New()
-
-	var wasServeTriggered bool
-
 	loader.Set("cronAdd", func(jobId, cronExpr, handler string) {
 		pr := goja.MustCompile("", "{("+handler+").apply(undefined)}", true)
 
-		err := scheduler.Add(jobId, cronExpr, func() {
+		err := app.Cron().Add(jobId, cronExpr, func() {
 			err := executors.run(func(executor *goja.Runtime) error {
 				_, err := executor.RunProgram(pr)
 				return err
@@ -133,32 +121,29 @@ func cronBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 		if err != nil {
 			panic("[cronAdd] failed to register cron job " + jobId + ": " + err.Error())
 		}
-
-		// start the ticker (if not already)
-		if wasServeTriggered && scheduler.Total() > 0 && !scheduler.HasStarted() {
-			scheduler.Start()
-		}
 	})
 
+	// note: it is not necessary needed but it is here for consistency
 	loader.Set("cronRemove", func(jobId string) {
-		scheduler.Remove(jobId)
-
-		// stop the ticker if there are no other jobs
-		if scheduler.Total() == 0 {
-			scheduler.Stop()
-		}
+		app.Cron().Remove(jobId)
 	})
 
-	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-		// start the ticker (if not already)
-		if scheduler.Total() > 0 && !scheduler.HasStarted() {
-			scheduler.Start()
-		}
+	// register the removal helper also in the executors to allow removing cron jobs from everywhere
+	oldFactory := executors.factory
+	executors.factory = func() *goja.Runtime {
+		vm := oldFactory()
 
-		wasServeTriggered = true
+		vm.Set("cronRemove", func(jobId string) {
+			app.Cron().Remove(jobId)
+		})
 
-		return nil
-	})
+		return vm
+	}
+	for _, item := range executors.items {
+		item.vm.Set("cronRemove", func(jobId string) {
+			app.Cron().Remove(jobId)
+		})
+	}
 }
 
 func routerBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
@@ -168,15 +153,15 @@ func routerBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 			panic("[routerAdd] failed to wrap middlewares: " + err.Error())
 		}
 
-		wrappedHandler, err := wrapHandler(executors, handler)
+		wrappedHandler, err := wrapHandlerFunc(executors, handler)
 		if err != nil {
 			panic("[routerAdd] failed to wrap handler: " + err.Error())
 		}
 
-		app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-			e.Router.Add(strings.ToUpper(method), path, wrappedHandler, wrappedMiddlewares...)
+		app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+			e.Router.Route(strings.ToUpper(method), path, wrappedHandler).Bind(wrappedMiddlewares...)
 
-			return nil
+			return e.Next()
 		})
 	})
 
@@ -186,40 +171,29 @@ func routerBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 			panic("[routerUse] failed to wrap middlewares: " + err.Error())
 		}
 
-		app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-			e.Router.Use(wrappedMiddlewares...)
-			return nil
-		})
-	})
-
-	loader.Set("routerPre", func(middlewares ...goja.Value) {
-		wrappedMiddlewares, err := wrapMiddlewares(executors, middlewares...)
-		if err != nil {
-			panic("[routerPre] failed to wrap middlewares: " + err.Error())
-		}
-
-		app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-			e.Router.Pre(wrappedMiddlewares...)
-			return nil
+		app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+			e.Router.Bind(wrappedMiddlewares...)
+			return e.Next()
 		})
 	})
 }
 
-func wrapHandler(executors *vmsPool, handler goja.Value) (echo.HandlerFunc, error) {
+func wrapHandlerFunc(executors *vmsPool, handler goja.Value) (func(*core.RequestEvent) error, error) {
 	if handler == nil {
 		return nil, errors.New("handler must be non-nil")
 	}
 
 	switch h := handler.Export().(type) {
-	case echo.HandlerFunc:
-		// "native" handler - no need to wrap
+	case func(*core.RequestEvent) error:
+		// "native" handler func - no need to wrap
 		return h, nil
 	case func(goja.FunctionCall) goja.Value, string:
 		pr := goja.MustCompile("", "{("+handler.String()+").apply(undefined, __args)}", true)
 
-		wrappedHandler := func(c echo.Context) error {
+		wrappedHandler := func(e *core.RequestEvent) error {
 			return executors.run(func(executor *goja.Runtime) error {
-				executor.Set("__args", []any{c})
+				executor.Set("$app", e.App) // overwrite the global $app with the hook scoped instance
+				executor.Set("__args", []any{e})
 				res, err := executor.RunProgram(pr)
 				executor.Set("__args", goja.Undefined())
 
@@ -240,29 +214,45 @@ func wrapHandler(executors *vmsPool, handler goja.Value) (echo.HandlerFunc, erro
 	}
 }
 
-func wrapMiddlewares(executors *vmsPool, rawMiddlewares ...goja.Value) ([]echo.MiddlewareFunc, error) {
-	wrappedMiddlewares := make([]echo.MiddlewareFunc, len(rawMiddlewares))
+type gojaHookHandler struct {
+	priority       int
+	id             string
+	serializedFunc string
+}
+
+func wrapMiddlewares(executors *vmsPool, rawMiddlewares ...goja.Value) ([]*hook.Handler[*core.RequestEvent], error) {
+	wrappedMiddlewares := make([]*hook.Handler[*core.RequestEvent], len(rawMiddlewares))
 
 	for i, m := range rawMiddlewares {
 		if m == nil {
-			return nil, errors.New("middleware func must be non-nil")
+			return nil, errors.New("middleware must be non-nil")
 		}
 
 		switch v := m.Export().(type) {
-		case echo.MiddlewareFunc:
-			// "native" middleware - no need to wrap
+		case *hook.Handler[*core.RequestEvent]:
+			// "native" middleware handler - no need to wrap
 			wrappedMiddlewares[i] = v
-		case func(goja.FunctionCall) goja.Value, string:
-			pr := goja.MustCompile("", "{(("+m.String()+").apply(undefined, __args)).apply(undefined, __args2)}", true)
+		case func(*core.RequestEvent) error:
+			// "native" middleware func - wrap as handler
+			wrappedMiddlewares[i] = &hook.Handler[*core.RequestEvent]{
+				Func: v,
+			}
+		case *gojaHookHandler:
+			if v.serializedFunc == "" {
+				return nil, errors.New("missing or invalid Middleware function")
+			}
 
-			wrappedMiddlewares[i] = func(next echo.HandlerFunc) echo.HandlerFunc {
-				return func(c echo.Context) error {
+			pr := goja.MustCompile("", "{("+v.serializedFunc+").apply(undefined, __args)}", true)
+
+			wrappedMiddlewares[i] = &hook.Handler[*core.RequestEvent]{
+				Id:       v.id,
+				Priority: v.priority,
+				Func: func(e *core.RequestEvent) error {
 					return executors.run(func(executor *goja.Runtime) error {
-						executor.Set("__args", []any{next})
-						executor.Set("__args2", []any{c})
+						executor.Set("$app", e.App) // overwrite the global $app with the hook scoped instance
+						executor.Set("__args", []any{e})
 						res, err := executor.RunProgram(pr)
 						executor.Set("__args", goja.Undefined())
-						executor.Set("__args2", goja.Undefined())
 
 						// check for returned error
 						if res != nil {
@@ -273,7 +263,29 @@ func wrapMiddlewares(executors *vmsPool, rawMiddlewares ...goja.Value) ([]echo.M
 
 						return err
 					})
-				}
+				},
+			}
+		case func(goja.FunctionCall) goja.Value, string:
+			pr := goja.MustCompile("", "{("+m.String()+").apply(undefined, __args)}", true)
+
+			wrappedMiddlewares[i] = &hook.Handler[*core.RequestEvent]{
+				Func: func(e *core.RequestEvent) error {
+					return executors.run(func(executor *goja.Runtime) error {
+						executor.Set("$app", e.App) // overwrite the global $app with the hook scoped instance
+						executor.Set("__args", []any{e})
+						res, err := executor.RunProgram(pr)
+						executor.Set("__args", goja.Undefined())
+
+						// check for returned error
+						if res != nil {
+							if v, ok := res.Export().(error); ok {
+								return v
+							}
+						}
+
+						return err
+					})
+				},
 			}
 		default:
 			return nil, errors.New("unsupported goja middleware type")
@@ -286,9 +298,10 @@ func wrapMiddlewares(executors *vmsPool, rawMiddlewares ...goja.Value) ([]echo.M
 func baseBinds(vm *goja.Runtime) {
 	vm.SetFieldNameMapper(FieldMapper{})
 
+	// deprecated: use toString
 	vm.Set("readerToString", func(r io.Reader, maxBytes int) (string, error) {
 		if maxBytes == 0 {
-			maxBytes = rest.DefaultMaxMemory
+			maxBytes = router.DefaultMaxMemory
 		}
 
 		limitReader := io.LimitReader(r, int64(maxBytes))
@@ -305,7 +318,7 @@ func baseBinds(vm *goja.Runtime) {
 		switch v := raw.(type) {
 		case io.Reader:
 			if maxReaderBytes == 0 {
-				maxReaderBytes = rest.DefaultMaxMemory
+				maxReaderBytes = router.DefaultMaxMemory
 			}
 
 			limitReader := io.LimitReader(v, int64(maxReaderBytes))
@@ -341,6 +354,36 @@ func baseBinds(vm *goja.Runtime) {
 		return elem.Addr().Interface()
 	})
 
+	vm.Set("unmarshal", func(data, dst any) error {
+		raw, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+
+		return json.Unmarshal(raw, &dst)
+	})
+
+	vm.Set("Context", func(call goja.ConstructorCall) *goja.Object {
+		var instance context.Context
+
+		oldCtx, ok := call.Argument(0).Export().(context.Context)
+		if ok {
+			instance = oldCtx
+		} else {
+			instance = context.Background()
+		}
+
+		key := call.Argument(1).Export()
+		if key != nil {
+			instance = context.WithValue(instance, key, call.Argument(2).Export())
+		}
+
+		instanceValue := vm.ToValue(instance).(*goja.Object)
+		instanceValue.SetPrototype(call.This.Prototype())
+
+		return instanceValue
+	})
+
 	vm.Set("DynamicModel", func(call goja.ConstructorCall) *goja.Object {
 		shape, ok := call.Argument(0).Export().(map[string]any)
 		if !ok || len(shape) == 0 {
@@ -355,17 +398,17 @@ func baseBinds(vm *goja.Runtime) {
 	})
 
 	vm.Set("Record", func(call goja.ConstructorCall) *goja.Object {
-		var instance *models.Record
+		var instance *core.Record
 
-		collection, ok := call.Argument(0).Export().(*models.Collection)
+		collection, ok := call.Argument(0).Export().(*core.Collection)
 		if ok {
-			instance = models.NewRecord(collection)
+			instance = core.NewRecord(collection)
 			data, ok := call.Argument(1).Export().(map[string]any)
 			if ok {
 				instance.Load(data)
 			}
 		} else {
-			instance = &models.Record{}
+			instance = &core.Record{}
 		}
 
 		instanceValue := vm.ToValue(instance).(*goja.Object)
@@ -375,24 +418,88 @@ func baseBinds(vm *goja.Runtime) {
 	})
 
 	vm.Set("Collection", func(call goja.ConstructorCall) *goja.Object {
-		instance := &models.Collection{}
+		instance := &core.Collection{}
 		return structConstructorUnmarshal(vm, call, instance)
 	})
 
-	vm.Set("Admin", func(call goja.ConstructorCall) *goja.Object {
-		instance := &models.Admin{}
+	vm.Set("FieldsList", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.FieldsList{}
 		return structConstructorUnmarshal(vm, call, instance)
 	})
 
-	vm.Set("Schema", func(call goja.ConstructorCall) *goja.Object {
-		instance := &schema.Schema{}
-		return structConstructorUnmarshal(vm, call, instance)
-	})
+	// fields
+	// ---
+	vm.Set("Field", func(call goja.ConstructorCall) *goja.Object {
+		data, _ := call.Argument(0).Export().(map[string]any)
+		rawDataSlice, _ := json.Marshal([]any{data})
 
-	vm.Set("SchemaField", func(call goja.ConstructorCall) *goja.Object {
-		instance := &schema.SchemaField{}
+		fieldsList := core.NewFieldsList()
+		_ = fieldsList.UnmarshalJSON(rawDataSlice)
+
+		if len(fieldsList) == 0 {
+			return nil
+		}
+
+		field := fieldsList[0]
+
+		fieldValue := vm.ToValue(field).(*goja.Object)
+		fieldValue.SetPrototype(call.This.Prototype())
+
+		return fieldValue
+	})
+	vm.Set("NumberField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.NumberField{}
 		return structConstructorUnmarshal(vm, call, instance)
 	})
+	vm.Set("BoolField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.BoolField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("TextField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.TextField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("URLField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.URLField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("EmailField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.EmailField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("EditorField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.EditorField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("PasswordField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.PasswordField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("DateField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.DateField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("AutodateField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.AutodateField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("JSONField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.JSONField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("RelationField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.RelationField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("SelectField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.SelectField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	vm.Set("FileField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.FileField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
+	// ---
 
 	vm.Set("MailerMessage", func(call goja.ConstructorCall) *goja.Object {
 		instance := &mailer.Message{}
@@ -405,8 +512,26 @@ func baseBinds(vm *goja.Runtime) {
 	})
 
 	vm.Set("RequestInfo", func(call goja.ConstructorCall) *goja.Object {
-		instance := &models.RequestInfo{Context: models.RequestInfoContextDefault}
+		instance := &core.RequestInfo{Context: core.RequestInfoContextDefault}
 		return structConstructor(vm, call, instance)
+	})
+
+	// ```js
+	// new Middleware((e) => {
+	//    return e.next()
+	// }, 100, "example_middleware")
+	// ```
+	vm.Set("Middleware", func(call goja.ConstructorCall) *goja.Object {
+		instance := &gojaHookHandler{}
+
+		instance.serializedFunc = call.Argument(0).String()
+		instance.priority = cast.ToInt(call.Argument(1).Export())
+		instance.id = cast.ToString(call.Argument(2).Export())
+
+		instanceValue := vm.ToValue(instance).(*goja.Object)
+		instanceValue.SetPrototype(call.This.Prototype())
+
+		return instanceValue
 	})
 
 	vm.Set("DateTime", func(call goja.ConstructorCall) *goja.Object {
@@ -428,24 +553,6 @@ func baseBinds(vm *goja.Runtime) {
 		message, _ := call.Argument(1).Export().(string)
 
 		instance := validation.NewError(code, message)
-		instanceValue := vm.ToValue(instance).(*goja.Object)
-		instanceValue.SetPrototype(call.This.Prototype())
-
-		return instanceValue
-	})
-
-	vm.Set("Dao", func(call goja.ConstructorCall) *goja.Object {
-		concurrentDB, _ := call.Argument(0).Export().(dbx.Builder)
-		if concurrentDB == nil {
-			panic("[Dao] missing required Dao(concurrentDB, [nonconcurrentDB]) argument")
-		}
-
-		nonConcurrentDB, _ := call.Argument(1).Export().(dbx.Builder)
-		if nonConcurrentDB == nil {
-			nonConcurrentDB = concurrentDB
-		}
-
-		instance := daos.NewMultiDB(concurrentDB, nonConcurrentDB)
 		instanceValue := vm.ToValue(instance).(*goja.Object)
 		instanceValue.SetPrototype(call.This.Prototype())
 
@@ -490,30 +597,10 @@ func mailsBinds(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$mails", obj)
 
-	// admin
-	obj.Set("sendAdminPasswordReset", mails.SendAdminPasswordReset)
-
-	// record
 	obj.Set("sendRecordPasswordReset", mails.SendRecordPasswordReset)
 	obj.Set("sendRecordVerification", mails.SendRecordVerification)
 	obj.Set("sendRecordChangeEmail", mails.SendRecordChangeEmail)
-}
-
-func tokensBinds(vm *goja.Runtime) {
-	obj := vm.NewObject()
-	vm.Set("$tokens", obj)
-
-	// admin
-	obj.Set("adminAuthToken", tokens.NewAdminAuthToken)
-	obj.Set("adminResetPasswordToken", tokens.NewAdminResetPasswordToken)
-	obj.Set("adminFileToken", tokens.NewAdminFileToken)
-
-	// record
-	obj.Set("recordAuthToken", tokens.NewRecordAuthToken)
-	obj.Set("recordVerifyToken", tokens.NewRecordVerifyToken)
-	obj.Set("recordResetPasswordToken", tokens.NewRecordResetPasswordToken)
-	obj.Set("recordChangeEmailToken", tokens.NewRecordChangeEmailToken)
-	obj.Set("recordFileToken", tokens.NewRecordFileToken)
+	obj.Set("sendRecordOTP", mails.SendRecordOTP)
 }
 
 func securityBinds(vm *goja.Runtime) {
@@ -530,6 +617,7 @@ func securityBinds(vm *goja.Runtime) {
 
 	// random
 	obj.Set("randomString", security.RandomString)
+	obj.Set("randomStringByRegex", security.RandomStringByRegex)
 	obj.Set("randomStringWithAlphabet", security.RandomStringWithAlphabet)
 	obj.Set("pseudorandomString", security.PseudorandomString)
 	obj.Set("pseudorandomStringWithAlphabet", security.PseudorandomStringWithAlphabet)
@@ -541,7 +629,9 @@ func securityBinds(vm *goja.Runtime) {
 	obj.Set("parseJWT", func(token string, verificationKey string) (map[string]any, error) {
 		return security.ParseJWT(token, verificationKey)
 	})
-	obj.Set("createJWT", security.NewJWT)
+	obj.Set("createJWT", func(payload jwt.MapClaims, signingKey string, secDuration int) (string, error) {
+		return security.NewJWT(payload, signingKey, time.Duration(secDuration)*time.Second)
+	})
 
 	// encryption
 	obj.Set("encrypt", security.Encrypt)
@@ -563,7 +653,7 @@ func filesystemBinds(vm *goja.Runtime) {
 	obj.Set("fileFromPath", filesystem.NewFileFromPath)
 	obj.Set("fileFromBytes", filesystem.NewFileFromBytes)
 	obj.Set("fileFromMultipart", filesystem.NewFileFromMultipart)
-	obj.Set("fileFromUrl", func(url string, secTimeout int) (*filesystem.File, error) {
+	obj.Set("fileFromURL", func(url string, secTimeout int) (*filesystem.File, error) {
 		if secTimeout == 0 {
 			secTimeout = 120
 		}
@@ -571,7 +661,7 @@ func filesystemBinds(vm *goja.Runtime) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(secTimeout)*time.Second)
 		defer cancel()
 
-		return filesystem.NewFileFromUrl(ctx, url)
+		return filesystem.NewFileFromURL(ctx, url)
 	})
 }
 
@@ -620,24 +710,8 @@ func osBinds(vm *goja.Runtime) {
 }
 
 func formsBinds(vm *goja.Runtime) {
-	registerFactoryAsConstructor(vm, "AdminLoginForm", forms.NewAdminLogin)
-	registerFactoryAsConstructor(vm, "AdminPasswordResetConfirmForm", forms.NewAdminPasswordResetConfirm)
-	registerFactoryAsConstructor(vm, "AdminPasswordResetRequestForm", forms.NewAdminPasswordResetRequest)
-	registerFactoryAsConstructor(vm, "AdminUpsertForm", forms.NewAdminUpsert)
 	registerFactoryAsConstructor(vm, "AppleClientSecretCreateForm", forms.NewAppleClientSecretCreate)
-	registerFactoryAsConstructor(vm, "CollectionUpsertForm", forms.NewCollectionUpsert)
-	registerFactoryAsConstructor(vm, "CollectionsImportForm", forms.NewCollectionsImport)
-	registerFactoryAsConstructor(vm, "RealtimeSubscribeForm", forms.NewRealtimeSubscribe)
-	registerFactoryAsConstructor(vm, "RecordEmailChangeConfirmForm", forms.NewRecordEmailChangeConfirm)
-	registerFactoryAsConstructor(vm, "RecordEmailChangeRequestForm", forms.NewRecordEmailChangeRequest)
-	registerFactoryAsConstructor(vm, "RecordOAuth2LoginForm", forms.NewRecordOAuth2Login)
-	registerFactoryAsConstructor(vm, "RecordPasswordLoginForm", forms.NewRecordPasswordLogin)
-	registerFactoryAsConstructor(vm, "RecordPasswordResetConfirmForm", forms.NewRecordPasswordResetConfirm)
-	registerFactoryAsConstructor(vm, "RecordPasswordResetRequestForm", forms.NewRecordPasswordResetRequest)
 	registerFactoryAsConstructor(vm, "RecordUpsertForm", forms.NewRecordUpsert)
-	registerFactoryAsConstructor(vm, "RecordVerificationConfirmForm", forms.NewRecordVerificationConfirm)
-	registerFactoryAsConstructor(vm, "RecordVerificationRequestForm", forms.NewRecordVerificationRequest)
-	registerFactoryAsConstructor(vm, "SettingsUpsertForm", forms.NewSettingsUpsert)
 	registerFactoryAsConstructor(vm, "TestEmailSendForm", forms.NewTestEmailSend)
 	registerFactoryAsConstructor(vm, "TestS3FilesystemForm", forms.NewTestS3Filesystem)
 }
@@ -646,33 +720,32 @@ func apisBinds(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$apis", obj)
 
-	obj.Set("staticDirectoryHandler", func(dir string, indexFallback bool) echo.HandlerFunc {
-		return apis.StaticDirectoryHandler(os.DirFS(dir), indexFallback)
+	obj.Set("static", func(dir string, indexFallback bool) func(*core.RequestEvent) error {
+		return apis.Static(os.DirFS(dir), indexFallback)
 	})
 
 	// middlewares
 	obj.Set("requireGuestOnly", apis.RequireGuestOnly)
-	obj.Set("requireRecordAuth", apis.RequireRecordAuth)
-	obj.Set("requireAdminAuth", apis.RequireAdminAuth)
-	obj.Set("requireAdminAuthOnlyIfAny", apis.RequireAdminAuthOnlyIfAny)
-	obj.Set("requireAdminOrRecordAuth", apis.RequireAdminOrRecordAuth)
-	obj.Set("requireAdminOrOwnerAuth", apis.RequireAdminOrOwnerAuth)
-	obj.Set("activityLogger", apis.ActivityLogger)
-	obj.Set("gzip", middleware.Gzip)
-	obj.Set("bodyLimit", middleware.BodyLimit)
+	obj.Set("requireAuth", apis.RequireAuth)
+	obj.Set("requireSuperuserAuth", apis.RequireSuperuserAuth)
+	obj.Set("requireSuperuserOrOwnerAuth", apis.RequireSuperuserOrOwnerAuth)
+	obj.Set("skipSuccessActivityLog", apis.SkipSuccessActivityLog)
+	obj.Set("gzip", apis.Gzip)
+	obj.Set("bodyLimit", apis.BodyLimit)
 
 	// record helpers
-	obj.Set("requestInfo", apis.RequestInfo)
 	obj.Set("recordAuthResponse", apis.RecordAuthResponse)
 	obj.Set("enrichRecord", apis.EnrichRecord)
 	obj.Set("enrichRecords", apis.EnrichRecords)
 
 	// api errors
-	registerFactoryAsConstructor(vm, "ApiError", apis.NewApiError)
-	registerFactoryAsConstructor(vm, "NotFoundError", apis.NewNotFoundError)
-	registerFactoryAsConstructor(vm, "BadRequestError", apis.NewBadRequestError)
-	registerFactoryAsConstructor(vm, "ForbiddenError", apis.NewForbiddenError)
-	registerFactoryAsConstructor(vm, "UnauthorizedError", apis.NewUnauthorizedError)
+	registerFactoryAsConstructor(vm, "ApiError", router.NewApiError)
+	registerFactoryAsConstructor(vm, "NotFoundError", router.NewNotFoundError)
+	registerFactoryAsConstructor(vm, "BadRequestError", router.NewBadRequestError)
+	registerFactoryAsConstructor(vm, "ForbiddenError", router.NewForbiddenError)
+	registerFactoryAsConstructor(vm, "UnauthorizedError", router.NewUnauthorizedError)
+	registerFactoryAsConstructor(vm, "TooManyRequestsError", router.NewTooManyRequestsError)
+	registerFactoryAsConstructor(vm, "InternalServerError", router.NewInternalServerError)
 }
 
 func httpClientBinds(vm *goja.Runtime) {
@@ -689,7 +762,7 @@ func httpClientBinds(vm *goja.Runtime) {
 	})
 
 	type sendResult struct {
-		Json       any                     `json:"json"`
+		JSON       any                     `json:"json"`
 		Headers    map[string][]string     `json:"headers"`
 		Cookies    map[string]*http.Cookie `json:"cookies"`
 		Raw        string                  `json:"raw"`
@@ -755,6 +828,8 @@ func httpClientBinds(vm *goja.Runtime) {
 			reqBody = bytes.NewReader(encoded)
 		} else {
 			switch v := config.Body.(type) {
+			case io.Reader:
+				reqBody = v
 			case FormData:
 				body, mp, err := v.toMultipart()
 				if err != nil {
@@ -783,13 +858,6 @@ func httpClientBinds(vm *goja.Runtime) {
 			req.Header.Set("content-type", contentType)
 		}
 
-		// @todo consider removing during the refactoring
-		//
-		// fallback to json content-type
-		if req.Header.Get("content-type") == "" {
-			req.Header.Set("content-type", "application/json")
-		}
-
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return nil, err
@@ -815,12 +883,12 @@ func httpClientBinds(vm *goja.Runtime) {
 
 		if len(result.Raw) != 0 {
 			// try as map
-			result.Json = map[string]any{}
-			if err := json.Unmarshal(bodyRaw, &result.Json); err != nil {
+			result.JSON = map[string]any{}
+			if err := json.Unmarshal(bodyRaw, &result.JSON); err != nil {
 				// try as slice
-				result.Json = []any{}
-				if err := json.Unmarshal(bodyRaw, &result.Json); err != nil {
-					result.Json = nil
+				result.JSON = []any{}
+				if err := json.Unmarshal(bodyRaw, &result.JSON); err != nil {
+					result.JSON = nil
 				}
 			}
 		}
@@ -892,7 +960,7 @@ func structConstructor(vm *goja.Runtime, call goja.ConstructorCall, instance any
 func structConstructorUnmarshal(vm *goja.Runtime, call goja.ConstructorCall, instance any) *goja.Object {
 	if data := call.Argument(0).Export(); data != nil {
 		if raw, err := json.Marshal(data); err == nil {
-			json.Unmarshal(raw, instance)
+			_ = json.Unmarshal(raw, instance)
 		}
 	}
 
@@ -921,13 +989,13 @@ func newDynamicModel(shape map[string]any) any {
 		switch kind := vt.Kind(); kind {
 		case reflect.Map:
 			raw, _ := json.Marshal(v)
-			newV := types.JsonMap{}
+			newV := types.JSONMap[any]{}
 			newV.Scan(raw)
 			v = newV
 			vt = reflect.TypeOf(v)
 		case reflect.Slice, reflect.Array:
 			raw, _ := json.Marshal(v)
-			newV := types.JsonArray[any]{}
+			newV := types.JSONArray[any]{}
 			newV.Scan(raw)
 			v = newV
 			vt = reflect.TypeOf(newV)

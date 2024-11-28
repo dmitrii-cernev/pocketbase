@@ -34,8 +34,23 @@ var parsedFilterData = store.New(make(map[string][]fexpr.ExprGroup, 50))
 //
 // The filter string can also contain dbx placeholder parameters (eg. "title = {:name}"),
 // that will be safely replaced and properly quoted inplace with the placeholderReplacements values.
+//
+// The parsed expressions are limited up to DefaultFilterExprLimit.
+// Use [FilterData.BuildExprWithLimit] if you want to set a custom limit.
 func (f FilterData) BuildExpr(
 	fieldResolver FieldResolver,
+	placeholderReplacements ...dbx.Params,
+) (dbx.Expression, error) {
+	return f.BuildExprWithLimit(fieldResolver, DefaultFilterExprLimit, placeholderReplacements...)
+}
+
+// BuildExpr parses the current filter data and returns a new db WHERE expression.
+//
+// The filter string can also contain dbx placeholder parameters (eg. "title = {:name}"),
+// that will be safely replaced and properly quoted inplace with the placeholderReplacements values.
+func (f FilterData) BuildExprWithLimit(
+	fieldResolver FieldResolver,
+	maxExpressions int,
 	placeholderReplacements ...dbx.Params,
 ) (dbx.Expression, error) {
 	raw := string(f)
@@ -64,9 +79,12 @@ func (f FilterData) BuildExpr(
 		}
 	}
 
-	if parsedFilterData.Has(raw) {
-		return buildParsedFilterExpr(parsedFilterData.Get(raw), fieldResolver)
+	cacheKey := raw + "/" + strconv.Itoa(maxExpressions)
+
+	if data, ok := parsedFilterData.GetOk(cacheKey); ok {
+		return buildParsedFilterExpr(data, fieldResolver, &maxExpressions)
 	}
+
 	data, err := fexpr.Parse(raw)
 	if err != nil {
 		// depending on the users demand we may allow empty expressions
@@ -78,15 +96,17 @@ func (f FilterData) BuildExpr(
 
 		return nil, err
 	}
+
 	// store in cache
 	// (the limit size is arbitrary and it is there to prevent the cache growing too big)
-	parsedFilterData.SetIfLessThanLimit(raw, data, 500)
-	return buildParsedFilterExpr(data, fieldResolver)
+	parsedFilterData.SetIfLessThanLimit(cacheKey, data, 500)
+
+	return buildParsedFilterExpr(data, fieldResolver, &maxExpressions)
 }
 
-func buildParsedFilterExpr(data []fexpr.ExprGroup, fieldResolver FieldResolver) (dbx.Expression, error) {
+func buildParsedFilterExpr(data []fexpr.ExprGroup, fieldResolver FieldResolver, maxExpressions *int) (dbx.Expression, error) {
 	if len(data) == 0 {
-		return nil, errors.New("empty filter expression")
+		return nil, fexpr.ErrEmpty
 	}
 
 	result := &concatExpr{separator: " "}
@@ -97,11 +117,17 @@ func buildParsedFilterExpr(data []fexpr.ExprGroup, fieldResolver FieldResolver) 
 
 		switch item := group.Item.(type) {
 		case fexpr.Expr:
+			if *maxExpressions <= 0 {
+				return nil, ErrFilterExprLimit
+			}
+
+			*maxExpressions--
+
 			expr, exprErr = resolveTokenizedExpr(item, fieldResolver)
 		case fexpr.ExprGroup:
-			expr, exprErr = buildParsedFilterExpr([]fexpr.ExprGroup{item}, fieldResolver)
+			expr, exprErr = buildParsedFilterExpr([]fexpr.ExprGroup{item}, fieldResolver, maxExpressions)
 		case []fexpr.ExprGroup:
-			expr, exprErr = buildParsedFilterExpr(item, fieldResolver)
+			expr, exprErr = buildParsedFilterExpr(item, fieldResolver, maxExpressions)
 		default:
 			exprErr = errors.New("unsupported expression item")
 		}
@@ -431,6 +457,8 @@ func mergeParams(params ...dbx.Params) dbx.Params {
 	return result
 }
 
+// @todo consider adding support for custom single character wildcard
+//
 // wrapLikeParams wraps each provided param value string with `%`
 // if the param doesn't contain an explicit wildcard (`%`) character already.
 func wrapLikeParams(params dbx.Params) dbx.Params {

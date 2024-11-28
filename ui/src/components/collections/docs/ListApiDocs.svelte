@@ -3,7 +3,7 @@
     import CommonHelper from "@/utils/CommonHelper";
     import CodeBlock from "@/components/base/CodeBlock.svelte";
     import FilterSyntax from "@/components/collections/docs/FilterSyntax.svelte";
-    import SdkTabs from "@/components/collections/docs/SdkTabs.svelte";
+    import SdkTabs from "@/components/base/SdkTabs.svelte";
     import FieldsQueryParam from "@/components/collections/docs/FieldsQueryParam.svelte";
 
     export let collection;
@@ -13,9 +13,11 @@
 
     $: fieldNames = CommonHelper.getAllCollectionIdentifiers(collection);
 
-    $: adminsOnly = collection?.listRule === null;
+    $: superusersOnly = collection?.listRule === null;
 
-    $: backendAbsUrl = CommonHelper.getApiExampleUrl(ApiClient.baseUrl);
+    $: backendAbsUrl = CommonHelper.getApiExampleUrl(ApiClient.baseURL);
+
+    $: dummyRecord = CommonHelper.dummyCollectionRecord(collection);
 
     $: if (collection?.id) {
         responses.push({
@@ -26,13 +28,10 @@
                     perPage: 30,
                     totalPages: 1,
                     totalItems: 2,
-                    items: [
-                        CommonHelper.dummyCollectionRecord(collection),
-                        CommonHelper.dummyCollectionRecord(collection),
-                    ],
+                    items: [dummyRecord, Object.assign({}, dummyRecord, { id: dummyRecord + "2" })],
                 },
                 null,
-                2
+                2,
             ),
         });
 
@@ -47,13 +46,13 @@
             `,
         });
 
-        if (adminsOnly) {
+        if (superusersOnly) {
             responses.push({
                 code: 403,
                 body: `
                     {
                       "code": 403,
-                      "message": "Only admins can access this action.",
+                      "message": "Only superusers can access this action.",
                       "data": {}
                     }
                 `,
@@ -79,12 +78,12 @@
 
         // fetch a paginated records list
         const resultList = await pb.collection('${collection?.name}').getList(1, 50, {
-            filter: 'created >= "2022-01-01 00:00:00" && someField1 != someField2',
+            filter: 'someField1 != someField2',
         });
 
         // you can also fetch all records at once via getFullList
         const records = await pb.collection('${collection?.name}').getFullList({
-            sort: '-created',
+            sort: '-someField',
         });
 
         // or fetch only the first record that matches the specified filter
@@ -103,12 +102,12 @@
         final resultList = await pb.collection('${collection?.name}').getList(
           page: 1,
           perPage: 50,
-          filter: 'created >= "2022-01-01 00:00:00" && someField1 != someField2',
+          filter: 'someField1 != someField2',
         );
 
         // you can also fetch all records at once via getFullList
         final records = await pb.collection('${collection?.name}').getFullList(
-          sort: '-created',
+          sort: '-someField',
         );
 
         // or fetch only the first record that matches the specified filter
@@ -127,8 +126,8 @@
             /api/collections/<strong>{collection.name}</strong>/records
         </p>
     </div>
-    {#if adminsOnly}
-        <p class="txt-hint txt-sm txt-right">Requires admin <code>Authorization:TOKEN</code> header</p>
+    {#if superusersOnly}
+        <p class="txt-hint txt-sm txt-right">Requires superuser <code>Authorization:TOKEN</code> header</p>
     {/if}
 </div>
 
@@ -174,6 +173,7 @@
                 <p>
                     <strong>Supported record sort fields:</strong> <br />
                     <code>@random</code>,
+                    <code>@rowid</code>,
                     {#each fieldNames as name, i}
                         <code>{name}</code>{i < fieldNames.length - 1 ? ", " : ""}
                     {/each}

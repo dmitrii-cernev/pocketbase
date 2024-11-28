@@ -1,11 +1,12 @@
-import { writable, get } from "svelte/store";
-import ApiClient    from "@/utils/ApiClient";
+import ApiClient from "@/utils/ApiClient";
 import CommonHelper from "@/utils/CommonHelper";
+import { get, writable } from "svelte/store";
 
-export const collections                    = writable([]);
-export const activeCollection               = writable({});
-export const isCollectionsLoading           = writable(false);
+export const collections = writable([]);
+export const activeCollection = writable({});
+export const isCollectionsLoading = writable(false);
 export const protectedFilesCollectionsCache = writable({});
+export const scaffolds = writable({});
 
 let notifyChannel;
 
@@ -21,14 +22,13 @@ function notifyOtherTabs() {
     notifyChannel?.postMessage("reload");
 }
 
-export function changeActiveCollectionById(collectionId) {
+export function changeActiveCollectionByIdOrName(collectionIdOrName) {
     collections.update((list) => {
-        const found = CommonHelper.findByKey(list, "id", collectionId);
-
+        const found = list.find((c) => c.id == collectionIdOrName || c.name == collectionIdOrName);
         if (found) {
             activeCollection.set(found);
         } else if (list.length) {
-            activeCollection.set(list[0]);
+            activeCollection.set(list.find((c) => !c.system) || list[0]);
         }
 
         return list;
@@ -58,7 +58,7 @@ export function removeCollection(collection) {
 
         activeCollection.update((current) => {
             if (current.id === collection.id) {
-                return list[0];
+                return list.find((c) => !c.system) || list[0];
             }
             return current;
         });
@@ -71,8 +71,8 @@ export function removeCollection(collection) {
     });
 }
 
-// load all collections (excluding the user profile)
-export async function loadCollections(activeId = null) {
+// load all collections
+export async function loadCollections(activeIdOrName = null) {
     isCollectionsLoading.set(true);
 
     try {
@@ -84,14 +84,16 @@ export async function loadCollections(activeId = null) {
 
         collections.set(items);
 
-        const item = activeId && CommonHelper.findByKey(items, "id", activeId);
+        const item = activeIdOrName && items.find((c) => c.id == activeIdOrName || c.name == activeIdOrName);
         if (item) {
             activeCollection.set(item);
         } else if (items.length) {
-            activeCollection.set(items[0]);
+            activeCollection.set(items.find((c) => !c.system) || items[0]);
         }
 
         refreshProtectedFilesCollectionsCache();
+
+        scaffolds.set(await ApiClient.collections.getScaffolds());
     } catch (err) {
         ApiClient.error(err);
     }
@@ -103,7 +105,7 @@ function refreshProtectedFilesCollectionsCache() {
     protectedFilesCollectionsCache.update((cache) => {
         collections.update((current) => {
             for (let c of current) {
-                cache[c.id] = !!c.schema?.find((f) => f.type == "file" && f.options?.protected);
+                cache[c.id] = !!c.fields?.find((f) => f.type == "file" && f.protected);
             }
 
             return current;
@@ -112,3 +114,4 @@ function refreshProtectedFilesCollectionsCache() {
         return cache;
     });
 }
+

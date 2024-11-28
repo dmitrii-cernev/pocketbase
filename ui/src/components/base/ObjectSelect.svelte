@@ -1,7 +1,7 @@
 <script>
-    import CommonHelper from "@/utils/CommonHelper";
-    import Select from "@/components/base/Select.svelte";
     import BaseSelectOption from "@/components/base/BaseSelectOption.svelte";
+    import Select from "@/components/base/Select.svelte";
+    import CommonHelper from "@/utils/CommonHelper";
 
     // original select props
     export let items = [];
@@ -50,7 +50,17 @@
     }
 </script>
 
-<Select bind:selected {items} {multiple} {labelComponent} {optionComponent} on:show on:hide {...$$restProps}>
+<Select
+    bind:selected
+    {items}
+    {multiple}
+    {labelComponent}
+    {optionComponent}
+    on:show
+    on:hide
+    on:change
+    {...$$restProps}
+>
     <svelte:fragment slot="afterOptions">
         <slot name="afterOptions" />
     </svelte:fragment>

@@ -1,4 +1,5 @@
 <script>
+    import tooltip from "@/actions/tooltip";
     import OverlayPanel from "@/components/base/OverlayPanel.svelte";
 
     const baseTabs = {
@@ -26,9 +27,17 @@
             label: "Realtime",
             component: import("@/components/collections/docs/RealtimeApiDocs.svelte"),
         },
+        batch: {
+            label: "Batch",
+            component: import("@/components/collections/docs/BatchApiDocs.svelte"),
+        },
     };
 
     const authTabs = {
+        "list-auth-methods": {
+            label: "List auth methods",
+            component: import("@/components/collections/docs/AuthMethodsDocs.svelte"),
+        },
         "auth-with-password": {
             label: "Auth with password",
             component: import("@/components/collections/docs/AuthWithPasswordDocs.svelte"),
@@ -37,45 +46,25 @@
             label: "Auth with OAuth2",
             component: import("@/components/collections/docs/AuthWithOAuth2Docs.svelte"),
         },
+        "auth-with-otp": {
+            label: "Auth with OTP",
+            component: import("@/components/collections/docs/AuthWithOtpDocs.svelte"),
+        },
         refresh: {
             label: "Auth refresh",
             component: import("@/components/collections/docs/AuthRefreshDocs.svelte"),
         },
-        "request-verification": {
-            label: "Request verification",
-            component: import("@/components/collections/docs/RequestVerificationDocs.svelte"),
+        verification: {
+            label: "Verification",
+            component: import("@/components/collections/docs/VerificationDocs.svelte"),
         },
-        "confirm-verification": {
-            label: "Confirm verification",
-            component: import("@/components/collections/docs/ConfirmVerificationDocs.svelte"),
+        "password-reset": {
+            label: "Password reset",
+            component: import("@/components/collections/docs/PasswordResetDocs.svelte"),
         },
-        "request-password-reset": {
-            label: "Request password reset",
-            component: import("@/components/collections/docs/RequestPasswordResetDocs.svelte"),
-        },
-        "confirm-password-reset": {
-            label: "Confirm password reset",
-            component: import("@/components/collections/docs/ConfirmPasswordResetDocs.svelte"),
-        },
-        "request-email-change": {
-            label: "Request email change",
-            component: import("@/components/collections/docs/RequestEmailChangeDocs.svelte"),
-        },
-        "confirm-email-change": {
-            label: "Confirm email change",
-            component: import("@/components/collections/docs/ConfirmEmailChangeDocs.svelte"),
-        },
-        "list-auth-methods": {
-            label: "List auth methods",
-            component: import("@/components/collections/docs/AuthMethodsDocs.svelte"),
-        },
-        "list-linked-accounts": {
-            label: "List OAuth2 accounts",
-            component: import("@/components/collections/docs/ListExternalAuthsDocs.svelte"),
-        },
-        "unlink-account": {
-            label: "Unlink OAuth2 account",
-            component: import("@/components/collections/docs/UnlinkExternalAuthDocs.svelte"),
+        "email-change": {
+            label: "Email change",
+            component: import("@/components/collections/docs/EmailChangeDocs.svelte"),
         },
     };
 
@@ -86,18 +75,16 @@
 
     $: if (collection.type === "auth") {
         tabs = Object.assign({}, baseTabs, authTabs);
-        if (!collection.options.allowUsernameAuth && !collection.options.allowEmailAuth) {
-            delete tabs["auth-with-password"];
-        }
-        if (!collection.options.allowOAuth2Auth) {
-            delete tabs["auth-with-oauth2"];
-        }
+        tabs["auth-with-password"].disabled = !collection.passwordAuth.enabled;
+        tabs["auth-with-oauth2"].disabled = !collection.oauth2.enabled;
+        tabs["auth-with-otp"].disabled = !collection.otp.enabled;
     } else if (collection.type === "view") {
         tabs = Object.assign({}, baseTabs);
         delete tabs.create;
         delete tabs.update;
         delete tabs.delete;
         delete tabs.realtime;
+        delete tabs.batch;
     } else {
         tabs = Object.assign({}, baseTabs);
     }
@@ -134,14 +121,23 @@
                         <hr class="m-t-sm m-b-sm" />
                     {/if}
 
-                    <button
-                        type="button"
-                        class="sidebar-item"
-                        class:active={activeTab === key}
-                        on:click={() => changeTab(key)}
-                    >
-                        {tab.label}
-                    </button>
+                    {#if tab.disabled}
+                        <div
+                            class="sidebar-item disabled"
+                            use:tooltip={{ position: "left", text: "Not enabled for the collection" }}
+                        >
+                            {tab.label}
+                        </div>
+                    {:else}
+                        <button
+                            type="button"
+                            class="sidebar-item"
+                            class:active={activeTab === key}
+                            on:click={() => changeTab(key)}
+                        >
+                            {tab.label}
+                        </button>
+                    {/if}
                 {/each}
             </nav>
         </aside>

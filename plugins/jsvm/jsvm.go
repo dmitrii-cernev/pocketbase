@@ -4,7 +4,7 @@
 // Example:
 //
 //	jsvm.MustRegister(app, jsvm.Config{
-//		WatchHooks: true,
+//		HooksWatch: true,
 //	})
 package jsvm
 
@@ -22,22 +22,18 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/buffer"
 	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/process"
 	"github.com/dop251/goja_nodejs/require"
 	"github.com/fatih/color"
 	"github.com/fsnotify/fsnotify"
-	"github.com/labstack/echo/v5"
-	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
-	m "github.com/pocketbase/pocketbase/migrations"
 	"github.com/pocketbase/pocketbase/plugins/jsvm/internal/types/generated"
 	"github.com/pocketbase/pocketbase/tools/template"
 )
 
-const (
-	typesFileName = "types.d.ts"
-)
+const typesFileName = "types.d.ts"
 
 // Config defines the config options of the jsvm plugin.
 type Config struct {
@@ -99,7 +95,7 @@ type Config struct {
 //		OnInit: func(vm *goja.Runtime) {
 //			// register custom bindings
 //			vm.Set("myCustomVar", 123)
-//		}
+//		},
 //	})
 func MustRegister(app core.App, config Config) {
 	if err := Register(app, config); err != nil {
@@ -131,9 +127,15 @@ func Register(app core.App, config Config) error {
 		p.config.TypesDir = app.DataDir()
 	}
 
-	p.app.OnAfterBootstrap().Add(func(e *core.BootstrapEvent) error {
+	p.app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+		err := e.Next()
+		if err != nil {
+			return err
+		}
+
 		// ensure that the user has the latest types declaration
-		if err := p.refreshTypesFile(); err != nil {
+		err = p.refreshTypesFile()
+		if err != nil {
 			color.Yellow("Unable to refresh app types file: %v", err)
 		}
 
@@ -168,19 +170,21 @@ func (p *plugin) registerMigrations() error {
 
 	for file, content := range files {
 		vm := goja.New()
+
 		registry.Enable(vm)
 		console.Enable(vm)
 		process.Enable(vm)
+		buffer.Enable(vm)
+
 		baseBinds(vm)
 		dbxBinds(vm)
-		tokensBinds(vm)
 		securityBinds(vm)
 		osBinds(vm)
 		filepathBinds(vm)
 		httpClientBinds(vm)
 
-		vm.Set("migrate", func(up, down func(db dbx.Builder) error) {
-			m.AppMigrations.Register(up, down, file)
+		vm.Set("migrate", func(up, down func(txApp core.App) error) {
+			core.AppMigrations.Register(up, down, file)
 		})
 
 		if p.config.OnInit != nil {
@@ -238,9 +242,10 @@ func (p *plugin) registerHooks() error {
 		return err
 	}
 
-	p.app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-		e.Router.HTTPErrorHandler = p.normalizeServeExceptions(e.Router.HTTPErrorHandler)
-		return nil
+	p.app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		e.Router.BindFunc(p.normalizeServeExceptions)
+
+		return e.Next()
 	})
 
 	// safe to be shared across multiple vms
@@ -251,11 +256,11 @@ func (p *plugin) registerHooks() error {
 		requireRegistry.Enable(vm)
 		console.Enable(vm)
 		process.Enable(vm)
+		buffer.Enable(vm)
 
 		baseBinds(vm)
 		dbxBinds(vm)
 		filesystemBinds(vm)
-		tokensBinds(vm)
 		securityBinds(vm)
 		osBinds(vm)
 		filepathBinds(vm)
@@ -311,32 +316,31 @@ func (p *plugin) registerHooks() error {
 	return nil
 }
 
-// normalizeExceptions wraps the provided error handler and returns a new one
-// with extracted goja exception error value for consistency when throwing or returning errors.
-func (p *plugin) normalizeServeExceptions(oldErrorHandler echo.HTTPErrorHandler) echo.HTTPErrorHandler {
-	return func(c echo.Context, err error) {
-		defer func() {
-			oldErrorHandler(c, err)
-		}()
+// normalizeExceptions registers a global error handler that
+// wraps the extracted goja exception error value for consistency
+// when throwing or returning errors.
+func (p *plugin) normalizeServeExceptions(e *core.RequestEvent) error {
+	err := e.Next()
 
-		if err == nil || c.Response().Committed {
-			return // no error or already committed
-		}
+	if err == nil || e.Written() {
+		return err // no error or already committed
+	}
 
-		jsException, ok := err.(*goja.Exception)
-		if !ok {
-			return // no exception
-		}
+	jsException, ok := err.(*goja.Exception)
+	if !ok {
+		return err // no exception
+	}
 
-		switch v := jsException.Value().Export().(type) {
-		case error:
-			err = v
-		case map[string]any: // goja.GoError
-			if vErr, ok := v["value"].(error); ok {
-				err = vErr
-			}
+	switch v := jsException.Value().Export().(type) {
+	case error:
+		err = v
+	case map[string]any: // goja.GoError
+		if vErr, ok := v["value"].(error); ok {
+			err = vErr
 		}
 	}
+
+	return err
 }
 
 // watchHooks initializes a hooks file watcher that will restart the
@@ -357,7 +361,7 @@ func (p *plugin) watchHooks() error {
 	if hooksDirInfo.Mode()&os.ModeSymlink == os.ModeSymlink {
 		watchDir, err = filepath.EvalSymlinks(p.config.HooksDir)
 		if err != nil {
-			return fmt.Errorf("failed to resolve hooksDir symlink: %w", err)
+			return fmt.Errorf("failed to resolve hooksDir symink: %w", err)
 		}
 	}
 
@@ -375,12 +379,12 @@ func (p *plugin) watchHooks() error {
 		}
 	}
 
-	p.app.OnTerminate().Add(func(e *core.TerminateEvent) error {
+	p.app.OnTerminate().BindFunc(func(e *core.TerminateEvent) error {
 		watcher.Close()
 
 		stopDebounceTimer()
 
-		return nil
+		return e.Next()
 	})
 
 	// start listening for events.

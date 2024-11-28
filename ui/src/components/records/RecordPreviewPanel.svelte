@@ -12,7 +12,7 @@
     let record = {};
     let isLoading = false;
 
-    $: hasEditorField = !!collection?.schema?.find((f) => f.type === "editor");
+    $: hasEditorField = !!collection?.fields?.find((f) => f.type === "editor");
 
     export function show(model) {
         load(model);
@@ -67,17 +67,7 @@
 
     <table class="table-border preview-table" class:table-loading={isLoading}>
         <tbody>
-            <tr>
-                <td class="min-width txt-hint txt-bold">id</td>
-                <td class="col-field">
-                    <div class="label">
-                        <CopyIcon value={record.id} />
-                        <span class="txt">{record.id || "..."}</span>
-                    </div>
-                </td>
-            </tr>
-
-            {#each collection?.schema as field}
+            {#each collection?.fields as field}
                 <tr>
                     <td class="min-width txt-hint txt-bold">{field.name}</td>
                     <td class="col-field">
@@ -85,20 +75,6 @@
                     </td>
                 </tr>
             {/each}
-
-            {#if record.created}
-                <tr>
-                    <td class="min-width txt-hint txt-bold">created</td>
-                    <td class="col-field"><FormattedDate date={record.created} /></td>
-                </tr>
-            {/if}
-
-            {#if record.updated}
-                <tr>
-                    <td class="min-width txt-hint txt-bold">updated</td>
-                    <td class="col-field"><FormattedDate date={record.updated} /></td>
-                </tr>
-            {/if}
         </tbody>
     </table>
 

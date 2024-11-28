@@ -3,6 +3,8 @@ package apis
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -12,14 +14,10 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/labstack/echo/v5"
-	"github.com/labstack/echo/v5/middleware"
-	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/migrations"
-	"github.com/pocketbase/pocketbase/migrations/logs"
+	"github.com/pocketbase/pocketbase/tools/hook"
 	"github.com/pocketbase/pocketbase/tools/list"
-	"github.com/pocketbase/pocketbase/tools/migrate"
+	"github.com/pocketbase/pocketbase/ui"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -29,10 +27,10 @@ type ServeConfig struct {
 	// ShowStartBanner indicates whether to show or hide the server start console message.
 	ShowStartBanner bool
 
-	// HttpAddr is the TCP address to listen for the HTTP server (eg. `127.0.0.1:80`).
+	// HttpAddr is the TCP address to listen for the HTTP server (eg. "127.0.0.1:80").
 	HttpAddr string
 
-	// HttpsAddr is the TCP address to listen for the HTTPS server (eg. `127.0.0.1:443`).
+	// HttpsAddr is the TCP address to listen for the HTTPS server (eg. "127.0.0.1:443").
 	HttpsAddr string
 
 	// Optional domains list to use when issuing the TLS certificate.
@@ -58,36 +56,36 @@ type ServeConfig struct {
 //		HttpAddr:        "127.0.0.1:8080",
 //		ShowStartBanner: false,
 //	})
-func Serve(app core.App, config ServeConfig) (*http.Server, error) {
+func Serve(app core.App, config ServeConfig) error {
 	if len(config.AllowedOrigins) == 0 {
 		config.AllowedOrigins = []string{"*"}
 	}
 
 	// ensure that the latest migrations are applied before starting the server
-	if err := runMigrations(app); err != nil {
-		return nil, err
-	}
-
-	// reload app settings in case a new default value was set with a migration
-	// (or if this is the first time the init migration was executed)
-	if err := app.RefreshSettings(); err != nil {
-		color.Yellow("=====================================")
-		color.Yellow("WARNING: Settings load error! \n%v", err)
-		color.Yellow("Fallback to the application defaults.")
-		color.Yellow("=====================================")
-	}
-
-	router, err := InitApi(app)
+	err := app.RunAllMigrations()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	// configure cors
-	router.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		Skipper:      middleware.DefaultSkipper,
+	pbRouter, err := NewRouter(app)
+	if err != nil {
+		return err
+	}
+
+	pbRouter.Bind(CORS(CORSConfig{
 		AllowOrigins: config.AllowedOrigins,
 		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete},
 	}))
+
+	pbRouter.GET("/_/{path...}", Static(ui.DistDirFS, false)).
+		BindFunc(func(e *core.RequestEvent) error {
+			// ingore root path
+			if e.Request.PathValue(StaticWildcardParam) != "" {
+				e.Response.Header().Set("Cache-Control", "max-age=1209600, stale-while-revalidate=86400")
+			}
+			return e.Next()
+		}).
+		Bind(Gzip())
 
 	// start http server
 	// ---
@@ -118,25 +116,12 @@ func Serve(app core.App, config ServeConfig) (*http.Server, error) {
 
 	// implicit www->non-www redirect(s)
 	if len(wwwRedirects) > 0 {
-		router.Pre(func(next echo.HandlerFunc) echo.HandlerFunc {
-			return func(c echo.Context) error {
-				host := c.Request().Host
-
-				if strings.HasPrefix(host, "www.") && list.ExistInSlice(host, wwwRedirects) {
-					return c.Redirect(
-						http.StatusTemporaryRedirect,
-						(c.Scheme() + "://" + host[4:] + c.Request().RequestURI),
-					)
-				}
-
-				return next(c)
-			}
-		})
+		pbRouter.Bind(wwwRedirect(wwwRedirects))
 	}
 
 	certManager := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
-		Cache:      autocert.DirCache(filepath.Join(app.DataDir(), ".autocert_cache")),
+		Cache:      autocert.DirCache(filepath.Join(app.DataDir(), core.LocalAutocertCacheDirName)),
 		HostPolicy: autocert.HostWhitelist(hostNames...),
 	}
 
@@ -151,39 +136,114 @@ func Serve(app core.App, config ServeConfig) (*http.Server, error) {
 			GetCertificate: certManager.GetCertificate,
 			NextProtos:     []string{acme.ALPNProto},
 		},
-		ReadTimeout:       10 * time.Minute,
+		// higher defaults to accommodate large file uploads/downloads
+		WriteTimeout:      3 * time.Minute,
+		ReadTimeout:       3 * time.Minute,
 		ReadHeaderTimeout: 30 * time.Second,
-		// WriteTimeout: 60 * time.Second, // breaks sse!
-		Handler: router,
-		Addr:    mainAddr,
+		Addr:              mainAddr,
 		BaseContext: func(l net.Listener) context.Context {
 			return baseCtx
 		},
 		ErrorLog: log.New(&serverErrorLogWriter{app: app}, "", 0),
 	}
 
-	serveEvent := &core.ServeEvent{
-		App:         app,
-		Router:      router,
-		Server:      server,
-		CertManager: certManager,
-	}
-	if err := app.OnBeforeServe().Trigger(serveEvent); err != nil {
-		return nil, err
-	}
+	serveEvent := new(core.ServeEvent)
+	serveEvent.App = app
+	serveEvent.Router = pbRouter
+	serveEvent.Server = server
+	serveEvent.CertManager = certManager
 
-	if config.ShowStartBanner {
-		schema := "http"
-		addr := server.Addr
+	var listener net.Listener
 
-		if config.HttpsAddr != "" {
-			schema = "https"
+	// graceful shutdown
+	// ---------------------------------------------------------------
+	// WaitGroup to block until server.ShutDown() returns because Serve and similar methods exit immediately.
+	// Note that the WaitGroup would do nothing if the app.OnTerminate() hook isn't triggered.
+	var wg sync.WaitGroup
 
-			if len(config.CertificateDomains) > 0 {
-				addr = config.CertificateDomains[0]
+	// try to gracefully shutdown the server on app termination
+	app.OnTerminate().Bind(&hook.Handler[*core.TerminateEvent]{
+		Id: "pbGracefulShutdown",
+		Func: func(te *core.TerminateEvent) error {
+			cancelBaseCtx()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+
+			wg.Add(1)
+
+			_ = server.Shutdown(ctx)
+
+			if te.IsRestart {
+				// wait for execve and other handlers up to 3 seconds before exit
+				time.AfterFunc(3*time.Second, func() {
+					wg.Done()
+				})
+			} else {
+				wg.Done()
+			}
+
+			return te.Next()
+		},
+		Priority: -9999,
+	})
+
+	// wait for the graceful shutdown to complete before exit
+	defer func() {
+		wg.Wait()
+
+		if listener != nil {
+			_ = listener.Close()
+		}
+	}()
+	// ---------------------------------------------------------------
+
+	// trigger the OnServe hook and start the tcp listener
+	serveHookErr := app.OnServe().Trigger(serveEvent, func(e *core.ServeEvent) error {
+		handler, err := e.Router.BuildMux()
+		if err != nil {
+			return err
+		}
+
+		e.Server.Handler = handler
+
+		addr := e.Server.Addr
+
+		// fallback similar to the std Server.ListenAndServe/ListenAndServeTLS
+		if addr == "" {
+			if config.HttpsAddr != "" {
+				addr = ":https"
+			} else {
+				addr = ":http"
 			}
 		}
 
+		var lnErr error
+
+		listener, lnErr = net.Listen("tcp", addr)
+
+		return lnErr
+	})
+	if serveHookErr != nil {
+		return serveHookErr
+	}
+
+	if listener == nil {
+		return errors.New("The OnServe finalizer wasn't invoked. Did you forget to call the ServeEvent.Next() method?")
+	}
+
+	schema := "http"
+	addr := server.Addr
+	if config.HttpsAddr != "" {
+		schema = "https"
+		if len(config.CertificateDomains) > 0 {
+			addr = config.CertificateDomains[0]
+		}
+	}
+	baseURL := fmt.Sprintf("%s://%s", schema, addr)
+	dashboardURL := fmt.Sprintf("%s/_", baseURL)
+
+	if config.ShowStartBanner {
 		date := new(strings.Builder)
 		log.New(date, "", log.LstdFlags).Print()
 
@@ -191,87 +251,36 @@ func Serve(app core.App, config ServeConfig) (*http.Server, error) {
 		bold.Printf(
 			"%s Server started at %s\n",
 			strings.TrimSpace(date.String()),
-			color.CyanString("%s://%s", schema, addr),
+			color.CyanString("%s", baseURL),
 		)
 
 		regular := color.New()
-		regular.Printf("├─ REST API: %s\n", color.CyanString("%s://%s/api/", schema, addr))
-		regular.Printf("└─ Admin UI: %s\n", color.CyanString("%s://%s/_/", schema, addr))
+		regular.Printf("├─ REST API:  %s\n", color.CyanString("%s/api/", baseURL))
+		regular.Printf("└─ Dashboard: %s\n", color.CyanString("%s/", dashboardURL))
 	}
 
-	// WaitGroup to block until server.ShutDown() returns because Serve and similar methods exit immediately.
-	// Note that the WaitGroup would not do anything if the app.OnTerminate() hook isn't triggered.
-	var wg sync.WaitGroup
-
-	// try to gracefully shutdown the server on app termination
-	app.OnTerminate().Add(func(e *core.TerminateEvent) error {
-		cancelBaseCtx()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		wg.Add(1)
-		server.Shutdown(ctx)
-		if e.IsRestart {
-			// wait for execve and other handlers up to 5 seconds before exit
-			time.AfterFunc(5*time.Second, func() {
-				wg.Done()
-			})
-		} else {
-			wg.Done()
+	go func() {
+		installerErr := loadInstaller(app, dashboardURL)
+		if installerErr != nil {
+			app.Logger().Warn("Failed to initialize installer", "error", installerErr)
 		}
+	}()
 
-		return nil
-	})
-
-	// wait for the graceful shutdown to complete before exit
-	defer wg.Wait()
-
-	// ---
-	// @todo consider removing the server return value because it is
-	// not really useful when combined with the blocking serve calls
-	// ---
-
-	// start HTTPS server
+	var serveErr error
 	if config.HttpsAddr != "" {
-		// if httpAddr is set, start an HTTP server to redirect the traffic to the HTTPS version
 		if config.HttpAddr != "" {
+			// start an additional HTTP server for redirecting the traffic to the HTTPS version
 			go http.ListenAndServe(config.HttpAddr, certManager.HTTPHandler(nil))
 		}
 
-		return server, server.ListenAndServeTLS("", "")
+		// start HTTPS server
+		serveErr = server.ServeTLS(listener, "", "")
+	} else {
+		// OR start HTTP server
+		serveErr = server.Serve(listener)
 	}
-
-	// OR start HTTP server
-	return server, server.ListenAndServe()
-}
-
-type migrationsConnection struct {
-	DB             *dbx.DB
-	MigrationsList migrate.MigrationsList
-}
-
-func runMigrations(app core.App) error {
-	connections := []migrationsConnection{
-		{
-			DB:             app.DB(),
-			MigrationsList: migrations.AppMigrations,
-		},
-		{
-			DB:             app.LogsDB(),
-			MigrationsList: logs.LogsMigrations,
-		},
-	}
-
-	for _, c := range connections {
-		runner, err := migrate.NewRunner(c.DB, c.MigrationsList)
-		if err != nil {
-			return err
-		}
-
-		if _, err := runner.Up(); err != nil {
-			return err
-		}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return serveErr
 	}
 
 	return nil
