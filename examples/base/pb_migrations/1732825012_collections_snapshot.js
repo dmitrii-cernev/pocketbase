@@ -523,6 +523,19 @@ migrate((app) => {
           "type": "relation"
         },
         {
+          "cascadeDelete": false,
+          "collectionId": "_pb_users_auth_",
+          "hidden": false,
+          "id": "relation3906892144",
+          "maxSelect": 1,
+          "minSelect": 0,
+          "name": "updated_by",
+          "presentable": false,
+          "required": false,
+          "system": false,
+          "type": "relation"
+        },
+        {
           "hidden": false,
           "id": "autodate2990389176",
           "name": "created",
